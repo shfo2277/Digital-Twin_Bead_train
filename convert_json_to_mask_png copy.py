@@ -1,55 +1,114 @@
-import json
-import cv2
-import numpy as np
-import os
 
 import os
 import json
 import cv2
 import numpy as np
-from glob import glob
-from tqdm import tqdm
 
-json_path = "/home/ho/Downloads/비드라벨링/비드"   # 네 JSON 폴더 경로로 수정
-img_dir = "/home/ho/BEADtrain/REAL/fitimage"        # capture_*.jpg 폴더
-save_dir = "/home/ho/BEADtrain/REAL/fitmask"
-os.makedirs(save_dir, exist_ok=True)
+JSON_DIR = "/home/ho/Downloads/end/2"
+OUT_DIR  = "/home/ho/Downloads/beadend/mask2"   # 저장 폴더
+TARGET_LABELS = ("end",)  # 너 JSON 라벨이 "end"
 
-# 저장 폴더 생성
-os.makedirs(save_dir, exist_ok=True)
-
-def json_to_mask(json_path):
-    with open(json_path, "r") as f:
+def convert_one(json_path: str, out_path: str):
+    with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     h = data["imageHeight"]
     w = data["imageWidth"]
-
-    # 빈 마스크 생성
     mask = np.zeros((h, w), dtype=np.uint8)
 
-    # polygon 그리기
-    for shape in data["shapes"]:
-        if shape["shape_type"] == "polygon":
-            pts = np.array(shape["points"], dtype=np.int32)
-            cv2.fillPoly(mask, [pts], 255)
+    for s in data.get("shapes", []):
+        if s.get("label") not in TARGET_LABELS:
+            continue
 
-    return mask, data["imagePath"]
-
-
-# 🟦 모든 JSON 파일 가져오기
-json_files = sorted(glob(os.path.join(json_path, "*.json")))
-
-for json_file in tqdm(json_files, desc="🔄 JSON → Mask 생성 중"):
-    mask, image_name = json_to_mask(json_file)
-
-    # 마스크 저장 이름
-    out_name = os.path.splitext(image_name)[0] + ".png"
-    out_path = os.path.join(save_dir, out_name)
+        pts = np.array(s.get("points", []), dtype=np.int32)
+        if len(pts) >= 3:
+            cv2.fillPoly(mask, [pts], 255)  # 비드=255, 배경=0
 
     cv2.imwrite(out_path, mask)
 
-print("✅ 모든 JSON 마스크 생성 완료!")
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    files = sorted([f for f in os.listdir(JSON_DIR) if f.lower().endswith(".json")])
+    if not files:
+        print("No json files in:", JSON_DIR)
+        return
+
+    ok, fail = 0, 0
+    for fn in files:
+        jp = os.path.join(JSON_DIR, fn)
+        outp = os.path.join(OUT_DIR, os.path.splitext(fn)[0] + ".png")
+        try:
+            convert_one(jp, outp)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            print("[FAIL]", fn, "->", e)
+
+    print(f"Done. success={ok}, fail={fail}")
+    print("Saved to:", OUT_DIR)
+
+if __name__ == "__main__":
+    main()
+
+
+
+# #===================================================
+
+# import json
+# import cv2
+# import numpy as np
+# import os
+
+# import os
+# import json
+# import cv2
+# import numpy as np
+# from glob import glob
+# from tqdm import tqdm
+
+# json_path = "/home/ho/Downloads/비드라벨링/비드"   # 네 JSON 폴더 경로로 수정
+# img_dir = "/home/ho/BEADtrain/REAL/fitimage"        # capture_*.jpg 폴더
+# save_dir = "/home/ho/BEADtrain/REAL/fitmask"
+# os.makedirs(save_dir, exist_ok=True)
+
+# # 저장 폴더 생성
+# os.makedirs(save_dir, exist_ok=True)
+
+# def json_to_mask(json_path):
+#     with open(json_path, "r") as f:
+#         data = json.load(f)
+
+#     h = data["imageHeight"]
+#     w = data["imageWidth"]
+
+#     # 빈 마스크 생성
+#     mask = np.zeros((h, w), dtype=np.uint8)
+
+#     # polygon 그리기
+#     for shape in data["shapes"]:
+#         if shape["shape_type"] == "polygon":
+#             pts = np.array(shape["points"], dtype=np.int32)
+#             cv2.fillPoly(mask, [pts], 255)
+
+#     return mask, data["imagePath"]
+
+
+# # 🟦 모든 JSON 파일 가져오기
+# json_files = sorted(glob(os.path.join(json_path, "*.json")))
+
+# for json_file in tqdm(json_files, desc="🔄 JSON → Mask 생성 중"):
+#     mask, image_name = json_to_mask(json_file)
+
+#     # 마스크 저장 이름
+#     out_name = os.path.splitext(image_name)[0] + ".png"
+#     out_path = os.path.join(save_dir, out_name)
+
+#     cv2.imwrite(out_path, mask)
+
+# print("✅ 모든 JSON 마스크 생성 완료!")
+
+
 
 
 

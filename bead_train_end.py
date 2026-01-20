@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 
 #==============================================
-# 0) CONFIG — 경로 / 설정 한 곳에서 관리
+# 0) CONFIG
 #==============================================
 RUN_TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
@@ -31,59 +31,53 @@ os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
 MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_DIR, "unet_best.pth")
 LOSS_FIG_PATH   = os.path.join(MODEL_SAVE_DIR, "loss_curve.png")
 
-
 DATA_ROOT = "/home/ho/BEADtrain/REAL"
+IMAGE_DIR = f"{DATA_ROOT}/end/endimg"
+MASK_DIR  = f"{DATA_ROOT}/end/endmask"
 
-# IMAGE_DIR = f"{DATA_ROOT}/endgrinding"
-# MASK_DIR  = f"{DATA_ROOT}/fitmask"
+IMAGE_SIZE = 1280          # 모델 입력 크기 (정사각)
+BATCH_SIZE = 2             # 1024면 1~2가 안정적 (원래 6은 터질 확률 높음)
+NUM_EPOCHS = 60
 
-IMAGE_DIR = f"{DATA_ROOT}/endgrinding"
-MASK_DIR  = f"{DATA_ROOT}/mask"
+# EarlyStopping
+EARLY_STOP_PATIENCE = 7
+EARLY_STOP_DELTA    = 1e-4
 
-IMAGE_SIZE = 1024          # 원래 코드에서 쓰던 값
-BATCH_SIZE = 6             # 원래 batch_size
-NUM_EPOCHS = 60            # 원래 num_epochs
+# Aug 옵션: end 라벨이 "방향 의미"가 있으면 flip은 끄는 게 안전
+USE_HFLIP = False
 
-# 🔥 EarlyStopping 설정
-EARLY_STOP_PATIENCE = 7     # 몇 epoch 동안 개선 없으면 stop
-EARLY_STOP_DELTA    = 1e-4  # 이 정도 이상 좋아져야 "개선"으로 인정
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
 #==============================================
-
-
-# 이미지 파일 목록 가져오기 (jpg, png 둘 다 대응)
-image_dir = IMAGE_DIR
-mask_dir  = MASK_DIR
-
+# 1) 데이터 경로 로드 / 매칭
+#==============================================
 image_paths = sorted(
-    glob.glob(os.path.join(image_dir, "*.jpg")) +
-    glob.glob(os.path.join(image_dir, "*.png"))
+    glob.glob(os.path.join(IMAGE_DIR, "*.jpg")) +
+    glob.glob(os.path.join(IMAGE_DIR, "*.png"))
 )
-
-print("총 이미지 개수:", len(image_paths))  # 70 근처 나와야 함
-
+print("총 이미지 개수:", len(image_paths))
 
 def get_mask_path(img_path):
     base = os.path.splitext(os.path.basename(img_path))[0]
     for ext in [".png", ".jpg"]:
-        cand = os.path.join(mask_dir, base + ext)
+        cand = os.path.join(MASK_DIR, base + ext)
         if os.path.exists(cand):
             return cand
     raise FileNotFoundError(f"Mask not found for {img_path}")
 
-
-random.seed(42)
+# shuffle + split
 random.shuffle(image_paths)
-
-# ✅ 총 데이터 기반 비율 분할 (Train 70%, Val 15%, Test 15%)
 n_total = len(image_paths)
-print("총 이미지 개수:", n_total)
 
 train_ratio = 0.7
-val_ratio   = 0.15  # 나머지 0.15는 test
+val_ratio   = 0.15
 
 n_train = int(n_total * train_ratio)
 n_val   = int(n_total * val_ratio)
-n_test  = n_total - n_train - n_val  # 자동 계산
+n_test  = n_total - n_train - n_val
 
 train_imgs = image_paths[:n_train]
 val_imgs   = image_paths[n_train:n_train+n_val]
@@ -91,14 +85,21 @@ test_imgs  = image_paths[n_train+n_val:]
 
 print("Train:", len(train_imgs), "Val:", len(val_imgs), "Test:", len(test_imgs))
 
+#==============================================
+# 2) Transform (핵심 수정: 비율 유지 + 패딩)
+#==============================================
+def build_train_transform(image_size=1024, use_hflip=False):
+    tfms = [
+        # ✅ 비율 유지 리사이즈 + 패딩 (왜곡 방지)
+        A.LongestMaxSize(max_size=image_size),
+        A.PadIfNeeded(min_height=image_size, min_width=image_size,
+                      border_mode=cv2.BORDER_CONSTANT, value=0, mask_value=0),
+    ]
 
-# 살짝 과적합 버전 (augment)
-train_transform = A.Compose(
-    [
-        A.Resize(IMAGE_SIZE, IMAGE_SIZE),
-        A.HorizontalFlip(p=0.5),
+    if use_hflip:
+        tfms.append(A.HorizontalFlip(p=0.5))
 
-        # 회전/이동은 너무 과하지 않게 (실제 영상 느낌으로)
+    tfms += [
         A.ShiftScaleRotate(
             shift_limit=0.03,
             scale_limit=0.05,
@@ -106,34 +107,37 @@ train_transform = A.Compose(
             border_mode=cv2.BORDER_REFLECT_101,
             p=0.7,
         ),
-
-        # 밝기/대비 변화 강화 (조명 변화 대응)
         A.RandomBrightnessContrast(
             brightness_limit=0.3,
             contrast_limit=0.3,
             p=0.8
         ),
-
-        # 노이즈/블러로 실제 카메라 느낌 추가
-        A.GaussNoise(p=0.3),
-        A.MotionBlur(blur_limit=5, p=0.3),
+        A.GaussNoise(p=0.2),
+        A.MotionBlur(blur_limit=5, p=0.15),
 
         A.Normalize(mean=(0.485, 0.456, 0.406),
                     std=(0.229, 0.224, 0.225)),
         ToTensorV2(),
     ]
-)
+    return A.Compose(tfms)
 
-val_transform = A.Compose(
-    [
-        A.Resize(IMAGE_SIZE, IMAGE_SIZE),
+def build_val_transform(image_size=1024):
+    return A.Compose([
+        A.LongestMaxSize(max_size=image_size),
+        A.PadIfNeeded(min_height=image_size, min_width=image_size,
+                      border_mode=cv2.BORDER_CONSTANT, value=0, mask_value=0),
+
         A.Normalize(mean=(0.485, 0.456, 0.406),
                     std=(0.229, 0.224, 0.225)),
         ToTensorV2(),
-    ]
-)
+    ])
 
+train_transform = build_train_transform(IMAGE_SIZE, use_hflip=USE_HFLIP)
+val_transform   = build_val_transform(IMAGE_SIZE)
 
+#==============================================
+# 3) Dataset
+#==============================================
 class BeadDataset(Dataset):
     def __init__(self, image_paths, transform=None):
         self.image_paths = image_paths
@@ -146,68 +150,75 @@ class BeadDataset(Dataset):
         img_path = self.image_paths[idx]
         mask_path = get_mask_path(img_path)
 
-        # 이미지 읽기 (BGR → RGB)
         image = cv2.imread(img_path, cv2.IMREAD_COLOR)
+        if image is None:
+            raise RuntimeError(f"Failed to read image: {img_path}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        # 마스크 읽기 (그레이스케일)
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise RuntimeError(f"Failed to read mask: {mask_path}")
 
-        # 마스크를 0~1로 스케일링 (binary segmentation 기준)
-        mask = mask / 255.0
-        mask = mask.astype("float32")
+        # ✅ 0/1로 확실히 이진화 (회색값/안티앨리어싱 제거)
+        mask = (mask > 127).astype(np.float32)   # 0 or 1
+        mask = np.expand_dims(mask, axis=-1)     # (H,W,1)
 
-        # H, W, 1 채널로 확장
-        mask = np.expand_dims(mask, axis=-1)
 
         if self.transform is not None:
             augmented = self.transform(image=image, mask=mask)
-            image = augmented["image"]
-            mask = augmented["mask"]
+            image = augmented["image"]       # torch (C,H,W)
+            mask  = augmented["mask"]        # torch (H,W,1) or (H,W)
 
-        # mask shape: [1, H, W] 로 맞추기 (원래 로직 유지)
-        if mask.ndim == 2:
-            mask = mask.unsqueeze(0)
-        elif mask.ndim == 3:
-            mask = mask.permute(2, 0, 1)  # HWC -> CHW
+        # mask -> (1,H,W)
+        if isinstance(mask, np.ndarray):
+            # 혹시 ToTensorV2가 없으면 대비
+            if mask.ndim == 2:
+                mask = mask[None, ...]
+            else:
+                mask = np.transpose(mask, (2, 0, 1))
+            mask = torch.from_numpy(mask).float()
+        else:
+            # torch tensor
+            if mask.ndim == 2:
+                mask = mask.unsqueeze(0)
+            elif mask.ndim == 3:
+                mask = mask.permute(2, 0, 1)
 
         return image, mask
-    
-
-batch_size = BATCH_SIZE  # 1024 해상도면 1~2 정도가 안전 (원래 값 6)
 
 train_dataset = BeadDataset(train_imgs, transform=train_transform)
 val_dataset   = BeadDataset(val_imgs,   transform=val_transform)
 test_dataset  = BeadDataset(test_imgs,  transform=val_transform)
 
-train_loader = DataLoader(train_dataset, batch_size=batch_size,
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE,
                           shuffle=True, num_workers=2, pin_memory=True)
 val_loader   = DataLoader(val_dataset, batch_size=1,
                           shuffle=False, num_workers=2, pin_memory=True)
 test_loader  = DataLoader(test_dataset, batch_size=1,
                           shuffle=False, num_workers=2, pin_memory=True)
 
-
+#==============================================
+# 4) device / model
+#==============================================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device:", device)
 
 model = smp.Unet(
     encoder_name="resnet34",
-    encoder_weights="imagenet",  # 필요 없으면 None
+    encoder_weights="imagenet",
     in_channels=3,
-    classes=1,                  # binary segmentation
-)
+    classes=1,
+).to(device)
 
-model = model.to(device)
-
-
+#==============================================
+# 5) Loss (Dice + BCE) + pos_weight 자동 계산
+#==============================================
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1.0):
         super().__init__()
         self.smooth = smooth
 
     def forward(self, preds, targets):
-        # preds: (B,1,H,W) logits
         preds = torch.sigmoid(preds)
         preds = preds.view(preds.size(0), -1)
         targets = targets.view(targets.size(0), -1)
@@ -218,38 +229,59 @@ class DiceLoss(nn.Module):
         )
         return 1 - dice.mean()
 
+def estimate_pos_weight(train_imgs, max_samples=200):
+    # train 마스크 픽셀 비율로 pos_weight = neg/pos 근사
+    sample_imgs = train_imgs[:min(len(train_imgs), max_samples)]
+    pos = 0
+    neg = 0
+    for ip in sample_imgs:
+        mp = get_mask_path(ip)
+        m = cv2.imread(mp, cv2.IMREAD_GRAYSCALE)
+        if m is None:
+            continue
+        # 0/255 -> 0/1
+        m = (m > 127).astype(np.uint8)
+        pos += int(m.sum())
+        neg += int(m.size - m.sum())
 
-# device와 model 정의된 뒤에 위치 (원래 주석 유지)
-pos_weight = torch.tensor([2.0], device=device)  # 2~5 사이 튜닝 가능
-bce_loss   = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-dice_loss  = DiceLoss()
+    if pos == 0:
+        return 1.0  # 전부 배경이면 fallback
+    return float(neg / pos)
 
+pos_w_value = estimate_pos_weight(train_imgs)
+pos_w_value = min(pos_w_value, 50.0)   # ✅ 상한 (너무 커지면 학습 불안정/부분 예측 가능)
+pos_weight = torch.tensor([pos_w_value], device=device)
+print(f"[pos_weight] estimated(clipped): {pos_w_value:.3f}")
+
+
+bce_loss  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+dice_loss = DiceLoss()
 
 def total_loss(preds, targets):
     return bce_loss(preds, targets) + dice_loss(preds, targets)
 
-
+#==============================================
+# 6) Optim / Scheduler
+#==============================================
 optimizer = optim.Adam(model.parameters(), lr=1e-4)
-
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer,
-    mode='min',
-    factor=0.5,   # val_loss 나빠지면 lr 1/2
-    patience=3,   # 3 epoch 동안 개선 없으면
+    optimizer, mode='min', factor=0.5, patience=3
 )
 
-
-def train_one_epoch(model, loader, optimizer, device):
+#==============================================
+# 7) Train / Val
+#==============================================
+def train_one_epoch(model, loader):
     model.train()
     epoch_loss = 0.0
 
-    for images, masks in tqdm(loader):
+    for images, masks in tqdm(loader, desc="Train", leave=False):
         images = images.to(device)
         masks  = masks.to(device)
 
-        optimizer.zero_grad()
-        outputs = model(images)  # (B,1,H,W)
-        loss = total_loss(outputs, masks)
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(images)
+        loss = total_loss(logits, masks)
         loss.backward()
         optimizer.step()
 
@@ -257,8 +289,7 @@ def train_one_epoch(model, loader, optimizer, device):
 
     return epoch_loss / len(loader.dataset)
 
-
-def validate(model, loader, device):
+def validate(model, loader):
     model.eval()
     epoch_loss = 0.0
 
@@ -267,18 +298,13 @@ def validate(model, loader, device):
             images = images.to(device)
             masks  = masks.to(device)
 
-            outputs = model(images)
-            loss = total_loss(outputs, masks)
+            logits = model(images)
+            loss = total_loss(logits, masks)
             epoch_loss += loss.item() * images.size(0)
 
     return epoch_loss / len(loader.dataset)
 
-
-def compute_iou_dice_from_logits(logits, targets, threshold=0.5, eps=1e-6):
-    """
-    logits: (B,1,H,W)  모델 출력 (sigmoid 전)
-    targets: (B,1,H,W)  GT 마스크 (0~1)
-    """
+def compute_iou_dice_from_logits(logits, targets, threshold=0.4, eps=1e-6):
     probs = torch.sigmoid(logits)
     preds = (probs > threshold).float()
     targets_bin = (targets > 0.5).float()
@@ -294,61 +320,40 @@ def compute_iou_dice_from_logits(logits, targets, threshold=0.5, eps=1e-6):
 
     return iou.mean().item(), dice.mean().item()
 
-
-num_epochs = NUM_EPOCHS
-
+#==============================================
+# 8) Loop + EarlyStopping + Best Save
+#==============================================
 best_val_loss = np.inf
-
 train_loss_history = []
 val_loss_history   = []
-
-# 🔥 EarlyStopping용 변수
 no_improve_count = 0
 
-for epoch in range(1, num_epochs+1):
-    train_loss = train_one_epoch(model, train_loader, optimizer, device)
-    val_loss   = validate(model, val_loader, device)
+for epoch in range(1, NUM_EPOCHS + 1):
+    train_loss = train_one_epoch(model, train_loader)
+    val_loss   = validate(model, val_loader)
 
-    # ✅ 기록
     train_loss_history.append(train_loss)
     val_loss_history.append(val_loss)
 
-    print(f"[{epoch}/{num_epochs}] train_loss={train_loss:.4f}  val_loss={val_loss:.4f}")
-
-    # 🔥 여기서 스케줄러에 val_loss 넘겨주기
+    print(f"[{epoch:02d}/{NUM_EPOCHS}] train_loss={train_loss:.4f}  val_loss={val_loss:.4f}")
     scheduler.step(val_loss)
 
-
-# #----------------------
-#     # 가장 좋은 모델 저장
-#     if val_loss < best_val_loss:
-#         best_val_loss = val_loss
-#         torch.save(model.state_dict(), MODEL_SAVE_PATH)
-#         print("  ✅ Best model updated")
-
-    # ==========================
-    # ✅ Best 모델 저장 + EarlyStopping 체크
-    # ==========================
-    # 이전 best보다 EARLY_STOP_DELTA 이상 좋아졌는지 확인
     if val_loss < (best_val_loss - EARLY_STOP_DELTA):
         best_val_loss = val_loss
         torch.save(model.state_dict(), MODEL_SAVE_PATH)
-        print("  ✅ Best model updated")
-        no_improve_count = 0  # 개선됐으니 카운터 리셋
+        print("  ✅ Best model updated:", MODEL_SAVE_PATH)
+        no_improve_count = 0
     else:
         no_improve_count += 1
-        print(f"  ⏳ No improvement count: {no_improve_count}/{EARLY_STOP_PATIENCE}")
+        print(f"  ⏳ No improvement: {no_improve_count}/{EARLY_STOP_PATIENCE}")
 
-        # 🔔 EarlyStopping 발동
         if no_improve_count >= EARLY_STOP_PATIENCE:
-            print("🛑 Early stopping triggered! (validation loss not improving)")
+            print("🛑 Early stopping triggered!")
             break
 
-
-#-------------평가 파트 -----------------------
-# ==========================
-# ✅  학습 곡선(Loss) 그래프 저장
-# ==========================
+#==============================================
+# 9) Loss Curve Save
+#==============================================
 plt.figure()
 plt.plot(train_loss_history, label="Train Loss")
 plt.plot(val_loss_history,   label="Val Loss")
@@ -357,44 +362,36 @@ plt.ylabel("Loss")
 plt.title("Training / Validation Loss")
 plt.legend()
 plt.grid(True)
-
 plt.savefig(LOSS_FIG_PATH, dpi=200)
 plt.close()
+print("📉 Loss curve saved:", LOSS_FIG_PATH)
 
-print(f"📉 Loss 곡선 저장 완료: {LOSS_FIG_PATH}")
-
-# ==========================
-# ✅  Test set IoU / Dice 평가
-# ==========================
-best_model_path = MODEL_SAVE_PATH
-state_dict = torch.load(best_model_path, map_location=device)
+#==============================================
+# 10) Test Eval (Best model)
+#==============================================
+state_dict = torch.load(MODEL_SAVE_PATH, map_location=device)
 model.load_state_dict(state_dict)
 model.to(device)
 model.eval()
-print(f"✅ Best 모델 로드 완료: {best_model_path}")
+print("✅ Best model loaded:", MODEL_SAVE_PATH)
 
-total_iou  = 0.0
-total_dice = 0.0
-num_batches = 0
-
+total_iou, total_dice, n = 0.0, 0.0, 0
 with torch.no_grad():
-    for images, masks in tqdm(test_loader, desc="Test 평가 중"):
+    for images, masks in tqdm(test_loader, desc="Test"):
         images = images.to(device)
         masks  = masks.to(device)
 
         logits = model(images)
-        batch_iou, batch_dice = compute_iou_dice_from_logits(logits, masks)
+        iou, dice = compute_iou_dice_from_logits(logits, masks)
 
-        total_iou  += batch_iou
-        total_dice += batch_dice
-        num_batches += 1
+        total_iou  += iou
+        total_dice += dice
+        n += 1
 
-avg_iou  = total_iou  / num_batches
-avg_dice = total_dice / num_batches
+avg_iou  = total_iou  / max(n, 1)
+avg_dice = total_dice / max(n, 1)
 
-#이건 분리해 놓은 테스트 데이터로 평가하고 있음
 print("==============================")
 print(f"📊 Test Mean IoU : {avg_iou:.4f}")
 print(f"📊 Test Mean Dice: {avg_dice:.4f}")
-print("    (IoU/Dice는 1.0에 가까울수록 좋음)")
 print("==============================")
