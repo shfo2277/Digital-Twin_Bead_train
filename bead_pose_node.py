@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 고정된 스캔 위치 로봇의 조인트를 값으로 주고 > 비드 경로 생성
 import math
 import cv2
 import numpy as np
@@ -13,7 +14,9 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 
 import tf2_ros
+from tf2_ros import StaticTransformBroadcaster
 from tf2_geometry_msgs import do_transform_pose
+from geometry_msgs.msg import TransformStamped
 import sensor_msgs_py.point_cloud2 as pc2
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
@@ -27,7 +30,7 @@ class BeadPoseNode(Node):
 
         self.bridge = CvBridge()
 
-        # ===== 카메라 Intrinsic =====
+        # ===== 카메라 Intrinsic ===== 이거 필요한가..?
         self.fx = self.fy = self.cx = self.cy = None
         self.camera_frame = None
 
@@ -38,11 +41,29 @@ class BeadPoseNode(Node):
         # RealSense depth scale (16UC1 -> meters)
         self.depth_scale = 0.001  # 필요하면 수정
 
-        # ===== TF Buffer / Listener =====
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        # ===== 경로 계산용 고정 변환 행렬 (TF lookup 안 함) =====
+        # base_link → tool0
+        T_base_tool0 = self._make_tf_matrix(
+            tx=0.223, ty=1.295, tz=0.794,
+            qx=0.500, qy=-0.500, qz=-0.500, qw=-0.500
+        )
+        # tool0 → camera_color_optical_frame
+        T_tool0_cam = self._make_tf_matrix(
+            tx=0.14673302, ty=0.01334886, tz=0.18633142,
+            qx=-0.510185, qy=0.494631, qz=-0.506893, qw=0.487965
+        )
+        # base_link → camera_color_optical_frame (합성)
+        self.T_base_cam = T_base_tool0 @ T_tool0_cam
+        self.get_logger().info('Direct TF matrix computed: base_link -> camera_color_optical_frame')
 
-        # ===== Sensor QoS =====
+        # ===== QoS Profiles =====
+        # 카메라 토픽은 RELIABLE로 publish됨
+        camera_qos = QoSProfile(
+            depth=10,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            history=QoSHistoryPolicy.KEEP_LAST
+        )
+        # bead/mask 는 BEST_EFFORT
         sensor_qos = QoSProfile(
             depth=10,
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -55,7 +76,7 @@ class BeadPoseNode(Node):
             '/camera/camera/color/camera_info',
             # '/camera/camera/depth/camera_info',
             self.caminfo_callback,
-            qos_profile=sensor_qos,
+            qos_profile=camera_qos,
         )
 
         self.sub_depth = self.create_subscription(
@@ -63,14 +84,14 @@ class BeadPoseNode(Node):
             # '/camera/camera/aligned_depth_to_color/image_raw',
             '/camera/camera/depth/image_rect_raw',
             self.depth_callback,
-            qos_profile=sensor_qos,
+            qos_profile=camera_qos,
         )
 
         self.sub_mask = self.create_subscription(
             Image,
             '/bead/mask',
             self.mask_callback,
-            10
+            qos_profile=sensor_qos,
         )
 
         # ===== Publishers =====
@@ -121,6 +142,19 @@ class BeadPoseNode(Node):
         )
 
         self.get_logger().info('✅ BeadPoseNode started.')
+
+    @staticmethod
+    def _make_tf_matrix(tx, ty, tz, qx, qy, qz, qw):
+        """쿼터니언 + 이동 → 4x4 변환 행렬"""
+        R = np.array([
+            [1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qz*qw), 2*(qx*qz + qy*qw)],
+            [2*(qx*qy + qz*qw), 1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qx*qw)],
+            [2*(qx*qz - qy*qw), 2*(qy*qz + qx*qw), 1 - 2*(qx*qx + qy*qy)],
+        ])
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = [tx, ty, tz]
+        return T
 
     # ---------------- reset 서비스 콜백 ----------------
     def reset_bead_path_cb(self, request, response):
@@ -224,39 +258,11 @@ class BeadPoseNode(Node):
 
         pts_cam = np.stack([X, Y, Z], axis=1)  # (N,3)
 
-        # 5) TF를 이용해 base_link 좌표계로 변환
-        try:
-            self.get_logger().info(f"Looking up TF base_link <- {self.camera_frame}")
-            trans = self.tf_buffer.lookup_transform(
-                'base_link',          # target
-                self.camera_frame,    # source
-                Time()                # latest
-            )
-            self.get_logger().info("TF lookup OK.")
-        except Exception as e:
-            self.get_logger().warn(f'TF lookup failed: {e}')
-            return
-
-        pts_base = []
-        for Xc, Yc, Zc in pts_cam:
-            ps = PoseStamped()
-            ps.header = self.depth_header
-            ps.header.frame_id = self.camera_frame
-            ps.pose.position.x = float(Xc)
-            ps.pose.position.y = float(Yc)
-            ps.pose.position.z = float(Zc)
-            ps.pose.orientation.w = 1.0
-
-            # Pose만 넘겨서 변환
-            pose_base = do_transform_pose(ps.pose, trans)
-
-            pts_base.append([
-                pose_base.position.x,
-                pose_base.position.y,
-                pose_base.position.z
-            ])
-
-        pts_base = np.array(pts_base)  # (N,3)
+        # 5) 직접 행렬 변환으로 base_link 좌표계로 변환
+        ones = np.ones((pts_cam.shape[0], 1))
+        pts_cam_h = np.hstack([pts_cam, ones])  # (N,4)
+        pts_base = (self.T_base_cam @ pts_cam_h.T).T[:, :3]  # (N,3)
+        self.get_logger().info(f"Direct TF applied: {pts_cam.shape[0]} points transformed")
 
         # 포인트가 너무 적으면 중단
         if pts_base.shape[0] < 10:
@@ -396,7 +402,17 @@ class BeadPoseNode(Node):
 
         # ✅ 첫 경로 계산 후 잠금
         self.path_locked = True
+        self.last_path_msg = path_msg
         self.get_logger().info("✅ Bead grind path locked. Further masks will be ignored.")
+
+        # 1초마다 경로 재퍼블리시 (브릿지/RViz 놓침 방지)
+        if not hasattr(self, '_path_timer'):
+            self._path_timer = self.create_timer(1.0, self._republish_path)
+
+    def _republish_path(self):
+        if hasattr(self, 'last_path_msg') and self.last_path_msg is not None:
+            self.last_path_msg.header.stamp = self.get_clock().now().to_msg()
+            self.path_pub.publish(self.last_path_msg)
 
 
 def main(args=None):
